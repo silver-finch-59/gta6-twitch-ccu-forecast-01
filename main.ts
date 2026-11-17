@@ -25,16 +25,32 @@
 //   * dip = ln(p1 / pre) — hour 1 against the last hour before midnight (bandwidth 0.5). A
 //                         deep dip below the pre-midnight evening means the audience has not
 //                         arrived yet and the daytime ramp is steeper.
-// The spread is the interquartile range of the library ratios around that median (robust sigma,
-// floored at 0.08 log units), pooled 50% toward the median sigma across hours, and the median
-// curve is smoothed 30% toward its 3-hour neighbours. Quantiles are p1 * exp(median + z_tau *
-// sigma) with the standard normal's z at the five scored levels.
+// The spread is asymmetric, because the pinball loss is: underpredicting the upper tail
+// costs 1.9 log units per unit at tau = 0.95, while overpredicting it costs 0.1, and the
+// reverse holds at tau = 0.05. So each hour gets two robust spreads from the kernel-weighted
+// quartiles of the library ratios around the weighted median: sigma_lo from the weighted
+// 25th percentile, sigma_hi from the weighted 75th. The symmetric IQR spread still anchors
+// both — sigma_lo never drops below 70% of it (a collapsed lower tail is what the pinball
+// loss punishes hardest when the day turns out quiet) and sigma_hi never exceeds 160% of
+// it — and each side is pooled 50% toward its own median across hours. Quantiles are
+// p1 * exp(median + z_tau * sigma_side) with the standard normal's z at the five levels.
 //
-// The bandwidths, the live filter, the pooling and the smoothing were chosen by leave-one-out
-// validation over all 42 launches in the kit (and by the 4 practice cases with their exact
-// 38-comparable libraries): practice mean pinball loss 0.229 against the house baseline's
-// 0.387, with every practice case beaten (0.347 / 0.208 / 0.165 / 0.197 vs 0.744 / 0.287 /
-// 0.215 / 0.303). Nothing is tuned on the final case, which the program never sees.
+// One systematic miss remains in the median itself: even among launches with a similar dip,
+// the kernel-weighted median underpredicts the daytime ramp of deep-dip launches (the
+// audience has not arrived yet at hour 1, so the ramp is steeper than the dip-similar
+// library median says). A deep-dip ramp boost corrects it: after smoothing, the median
+// log-ratio at hour h is raised by 1.25 * max(0, -dip) * exp(-0.5 * ((h - 18) / 7)^2) —
+// nothing for a flat or positive dip, up to ~1.25 log units at the evening peak for the
+// deepest dips in the library. The median curve is smoothed 30% toward its 3-hour
+// neighbours before the boost.
+//
+// The bandwidths, the live filter, the pooling, the smoothing, the boost and the spread
+// floors were chosen by leave-one-out validation over all 42 launches in the kit (and by
+// the 4 practice cases with their exact 38-comparable libraries): practice mean pinball
+// loss 0.162 against the house baseline's 0.387, with every practice case beaten
+// (0.168 / 0.148 / 0.145 / 0.188 vs 0.744 / 0.287 / 0.215 / 0.303); leave-one-out over
+// the 33 live-at-midnight launches 0.233 (0.243 on the builder's unfiltered-library
+// variant). Nothing is tuned on the final case, which the program never sees.
 //
 // What the program does NOT use: `streams` and `categories_hourly` (null in the practice
 // cases, so unvalidatable), and any within-hour-1 minute slope (also unvalidatable on hourly
@@ -68,6 +84,16 @@ const BW_DIP = 0.5;
 const SPREAD_POOL = 0.5;
 /** How far each hour's median is shrunk toward its 3-hour neighbours. */
 const SMOOTH = 0.3;
+/** Deep-dip ramp boost: log units added to the smoothed median at the peak, per unit of dip depth. */
+const RAMP_BOOST_BETA = 1.25;
+/** Centre (hour) of the boost's Gaussian bump over the day. */
+const RAMP_BOOST_CENTER = 18;
+/** Width (hours) of the boost's Gaussian bump over the day. */
+const RAMP_BOOST_WIDTH = 7;
+/** The weighted-quartile lower spread never drops below this fraction of the symmetric IQR spread. */
+const SPREAD_LO_FLOOR = 0.7;
+/** The weighted-quartile upper spread never exceeds this multiple of the symmetric IQR spread. */
+const SPREAD_HI_CAP = 1.6;
 /** Smallest spread allowed for one hour, in log units. */
 const MIN_SIGMA = 0.08;
 /** A launch counts as live at its UTC midnight only above this hour-1 print. */
@@ -149,6 +175,19 @@ const weightedMedian = (pairs: Array<[number, number]>): number => {
   for (const [v, w] of usable) {
     acc += w;
     if (acc >= total / 2) return v;
+  }
+  return usable[usable.length - 1][0];
+};
+
+/** Weighted quantile: the smallest value whose cumulative weight reaches q of the total. */
+const weightedQuantile = (pairs: Array<[number, number]>, q: number): number => {
+  const usable = pairs.filter(([, w]) => w > 0).sort((a, b) => a[0] - b[0]);
+  if (usable.length === 0) return 0;
+  const total = usable.reduce((acc, [, w]) => acc + w, 0);
+  let acc = 0;
+  for (const [v, w] of usable) {
+    acc += w;
+    if (acc >= q * total) return v;
   }
   return usable[usable.length - 1][0];
 };
@@ -235,9 +274,13 @@ const kernelWeight = (launch: LibraryLaunch, logP1: number, dip: number): number
   return Math.exp(-0.5 * (a * a + b * b));
 };
 
-/** The five quantiles for one hour, from a median log-ratio and a spread. */
-const hourQuantiles = (p1: number, med: number, sigma: number): number[] => {
-  const qs = Z.map((z) => round2(Math.min(1e9, Math.max(1, p1 * Math.exp(med + z * sigma)))));
+/** The five quantiles for one hour, from a median log-ratio and its two spreads.
+ *  Levels below the median use sigmaLo, levels above it sigmaHi. */
+const hourQuantiles = (p1: number, med: number, sigmaLo: number, sigmaHi: number): number[] => {
+  const qs = Z.map((z, i) => {
+    const sigma = LEVELS[i] < 0.5 ? sigmaLo : sigmaHi;
+    return round2(Math.min(1e9, Math.max(1, p1 * Math.exp(med + z * sigma))));
+  });
   for (let i = 1; i < qs.length; i++) if (qs[i] < qs[i - 1]) qs[i] = qs[i - 1];
   return qs;
 };
@@ -254,7 +297,7 @@ const forecastCase = (c: Case): Array<{ hour: number; q: number[] }> => {
 
   // No usable comparables: fall back to a fixed-spread persistence around hour 1.
   if (pool.length === 0) {
-    return forecastHours.map((h) => ({ hour: h, q: hourQuantiles(p1, 0, FALLBACK_SIGMA) }));
+    return forecastHours.map((h) => ({ hour: h, q: hourQuantiles(p1, 0, FALLBACK_SIGMA, FALLBACK_SIGMA) }));
   }
 
   const dayStartMs = ms(c.day_start);
@@ -263,9 +306,10 @@ const forecastCase = (c: Case): Array<{ hour: number; q: number[] }> => {
   const targetDip = pre !== null && pre > 0 ? Math.log(p1 / pre) : 0;
   const targetLogP1 = Math.log(p1);
 
-  // Per-hour weighted median of the library's log-ratios, and its robust spread.
+  // Per-hour weighted median of the library's log-ratios, and its two robust spreads.
   const medByHour = new Map<number, number>();
-  const sigmaByHour = new Map<number, number>();
+  const sigmaLoByHour = new Map<number, number>();
+  const sigmaHiByHour = new Map<number, number>();
   for (let h = 2; h <= 24; h++) {
     const pairs: Array<[number, number]> = [];
     for (const launch of pool) {
@@ -276,8 +320,21 @@ const forecastCase = (c: Case): Array<{ hour: number; q: number[] }> => {
     const med = weightedMedian(pairs);
     medByHour.set(h, med);
     const resid = pairs.map(([r]) => r - med);
-    const sigma = Math.max(MIN_SIGMA, (quantile(resid, 0.75) - quantile(resid, 0.25)) / 1.349);
-    sigmaByHour.set(h, sigma);
+    // Symmetric IQR spread anchors both sides; the weighted quartiles give the skew.
+    // (Unweighted quartiles around the weighted median are mis-centred and were much
+    // worse in validation, so both quartiles use the same kernel weights as the median.)
+    const symSigma = Math.max(MIN_SIGMA, (quantile(resid, 0.75) - quantile(resid, 0.25)) / 1.349);
+    const sigmaLo = Math.max(
+      MIN_SIGMA,
+      SPREAD_LO_FLOOR * symSigma,
+      (med - weightedQuantile(pairs, 0.25)) / 0.6744897501960817,
+    );
+    const sigmaHi = Math.min(
+      Math.max(MIN_SIGMA, (weightedQuantile(pairs, 0.75) - med) / 0.6744897501960817),
+      SPREAD_HI_CAP * symSigma,
+    );
+    sigmaLoByHour.set(h, sigmaLo);
+    sigmaHiByHour.set(h, sigmaHi);
   }
   // Hours with no library value borrow the nearest hour that has one.
   const have = [...medByHour.keys()].sort((a, b) => a - b);
@@ -286,13 +343,16 @@ const forecastCase = (c: Case): Array<{ hour: number; q: number[] }> => {
       const near = have.reduce((best, hh) =>
         Math.abs(hh - h) < Math.abs(best - h) ? hh : best, have[0]);
       medByHour.set(h, medByHour.get(near)!);
-      sigmaByHour.set(h, sigmaByHour.get(near)!);
+      sigmaLoByHour.set(h, sigmaLoByHour.get(near)!);
+      sigmaHiByHour.set(h, sigmaHiByHour.get(near)!);
     }
   }
-  // Pool the spreads toward their median, then smooth the medians across neighbours.
-  const pooledSigma = median([...sigmaByHour.values()]);
-  for (const h of sigmaByHour.keys()) {
-    sigmaByHour.set(h, (1 - SPREAD_POOL) * sigmaByHour.get(h)! + SPREAD_POOL * pooledSigma);
+  // Pool each side's spreads toward its own median, then smooth the medians across neighbours.
+  for (const side of [sigmaLoByHour, sigmaHiByHour]) {
+    const pooledSigma = median([...side.values()]);
+    for (const h of side.keys()) {
+      side.set(h, (1 - SPREAD_POOL) * side.get(h)! + SPREAD_POOL * pooledSigma);
+    }
   }
   const smoothed = new Map<number, number>();
   for (let h = 2; h <= 24; h++) {
@@ -300,9 +360,20 @@ const forecastCase = (c: Case): Array<{ hour: number; q: number[] }> => {
     const avg = neigh.reduce((a, b) => a + b, 0) / neigh.length;
     smoothed.set(h, (1 - SMOOTH) * medByHour.get(h)! + SMOOTH * avg);
   }
+  // Deep-dip ramp boost: a launch whose hour 1 sits far below its pre-midnight evening
+  // has its audience still arriving, so its daytime ramp runs steeper than the median of
+  // dip-similar library launches. Lift the smoothed median by a Gaussian bump centred on
+  // the evening peak, scaled by how deep the dip is; flat or positive dips get nothing.
+  const dipDepth = Math.max(0, -targetDip);
+  if (dipDepth > 0) {
+    for (let h = 2; h <= 24; h++) {
+      const shape = Math.exp(-0.5 * ((h - RAMP_BOOST_CENTER) / RAMP_BOOST_WIDTH) ** 2);
+      smoothed.set(h, smoothed.get(h)! + RAMP_BOOST_BETA * dipDepth * shape);
+    }
+  }
   return forecastHours.map((h) => ({
     hour: h,
-    q: hourQuantiles(p1, smoothed.get(h) ?? 0, sigmaByHour.get(h) ?? FALLBACK_SIGMA),
+    q: hourQuantiles(p1, smoothed.get(h) ?? 0, sigmaLoByHour.get(h) ?? FALLBACK_SIGMA, sigmaHiByHour.get(h) ?? FALLBACK_SIGMA),
   }));
 };
 
